@@ -1,0 +1,445 @@
+---
+title: "MOON_analysis"
+author: "Anne-Claire Kroger"
+date: "2023-09-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(decoupleR)
+library(OmnipathR)
+library(readr)
+library(cosmosR)
+library(MOFA2)
+library(stringr)
+library(data.table)
+library(pheatmap)
+library(ggplot2)
+```
+
+
+#Import data
+```{r}
+
+#MOFA results 
+gbm_MOFAobject <- readRDS("mofa_results/mofa_gbm_prot_phospho_f15.RDS")
+gbm_MOFAobject_REG <- readRDS("mofa_results/mofa_gbm_NOprot_REGphospho_f15.RDS")
+
+brca_MOFAobject <- readRDS("mofa_results/mofa_brca_prot_phospho_f15.RDS")
+brca_MOFAobject_REG <- readRDS("mofa_results/mofa_brca_NOprot_REGphospho_f15.RDS")
+
+```
+Everything with "REG" in the name means the proteomics abundance was regressed out of the phosphoproteomics data before running MOFA.
+
+```{R}
+#Investigate MOFA factors 
+MOFAobject <- brca_MOFAobject_REG
+
+pheatmap(MOFAobject@cache$variance_explained$r2_per_factor[[1]], display_numbers = T, angle_col = "0", legend_labels = c("0","10", "20", "30", "40", "Variance\n\n"), legend = T, main = "", legend_breaks = c(0,10, 20, 30, 40, max(MOFAobject@cache$variance_explained$r2_per_factor[[1]])), cluster_rows = F, cluster_cols = F, color = colorRampPalette(c("white","red"))(100), fontsize_number = 10)
+
+correlate_factors_with_covariates(MOFAobject, 
+                                    covariates = c("PAM50", "NMF.Cluster"))
+  
+plot_factor(MOFAobject, 
+            factors = c(1,3,4),        #change factor you want to display
+            #color_by = "Proteome_2023",
+            #color_by = "PAM50",
+            color_by = "NMF.Cluster",
+            #color_by = "multiomic",
+            #color_by = "rna_wang_cancer_cell_2017",
+            dot_size = 3,        
+            dodge = T,           
+            legend = T,          
+            add_boxplot = T  
+)
+
+```
+Factors of interest
+
+GBM: Factor 1,2,5(IDH),(3,7)
+GBM_REG: Factor 1,2,6(IDH),(5)
+
+BRCA: Factor 1,2,4 
+BRCA_REG: 1,4
+
+```{r}
+#brca
+brca_weights_rna <- get_weights(brca_MOFAobject, factors = "all")$Transcriptome
+brca_weights_phospho <- get_weights(brca_MOFAobject, factors = "all")$Phosphoproteome
+
+rownames(brca_weights_rna) <- str_replace(rownames(brca_weights_rna), "_.*", "")
+
+brca_weightsREG_rna <- get_weights(brca_MOFAobject_REG, factors = "all")$Transcriptome
+brca_weightsREG_phospho <- get_weights(brca_MOFAobject_REG, factors = "all")$REG_Phosphoproteome
+
+rownames(brca_weightsREG_rna) <- str_replace(rownames(brca_weightsREG_rna), "_.*", "")
+
+#gbm
+gbm_weights_rna <- get_weights(gbm_MOFAobject, factors = "all")$Transcriptome
+gbm_weights_phospho <- get_weights(gbm_MOFAobject, factors = "all")$Phosphoproteome
+
+rownames(gbm_weights_rna) <- str_replace(rownames(gbm_weights_rna), "_.*", "")
+
+gbm_weightsREG_rna <- get_weights(gbm_MOFAobject_REG, factors = "all")$Transcriptome
+gbm_weightsREG_phospho <- get_weights(gbm_MOFAobject_REG, factors = "all")$REG_Phosphoproteome
+
+rownames(gbm_weightsREG_rna) <- str_replace(rownames(gbm_weightsREG_rna), "_.*", "")
+
+#scaling not necessary because we are only using one data type for upstream nodes
+```
+
+#Do basic TF activity and Kinase activity prediction on all MOFA factors
+
+##Get target networks: TF targets, Kinase targets
+```{r}
+#Kinase targets (code from aurelien old script)
+KSN <- OmnipathR::import_omnipath_enzsub()
+KSN <- KSN[!KSN$sources == "KEA",]
+KSN$target <- paste(KSN$substrate_genesymbol, paste(KSN$residue_type, KSN$residue_offset, sep = ""), sep = "_")
+KSN$mor <- ifelse(KSN$modification == "phosphorylation", 1, ifelse(KSN$modification == "dephosphorylation", -1, NA))
+KSN <- KSN[,c(3,13,14)]
+names(KSN) <- c("source","target","mor")
+KSN$enzsub <- paste(KSN$source, KSN$target, sep = "_")
+dubs <- KSN[duplicated(KSN$enzsub), "enzsub", drop = T]
+KSN <- KSN[-which(KSN$enzsub %in% dubs),]
+KSN <- KSN[,-4]
+
+dim(KSN) #ressource has 36495 commections with 670 Kinase (sources) with at least 5 connections
+
+saveRDS(KSN, "network_ressources/KSN_omnipath_noKEA_network.RDS")
+```
+
+```{r}
+#Load Kinase targets
+KSN <- readRDS("network_ressources/KSN_omnipath_noKEA_network.RDS")
+
+#Load TF targets (from Aurelien MOON script)
+TFN <- decoupleR::get_collectri()
+
+```
+
+
+##TF activity prediction on Transcriptomics layer of MOFA results with ulm
+```{r}
+#brca
+brca_tf <- decoupleR::run_ulm(brca_weights_rna, 
+                              TFN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 5) 
+
+brca_tf_df <- as.data.frame(dcast(as.data.table(brca_tf[,2:4]), source ~ condition, value.var = "score"))
+rownames(brca_tf_df) <- brca_tf_df$source
+brca_tf_df <- brca_tf_df[,-1]
+
+saveRDS(brca_tf, "kin_tf_prediction_results/brca_mofa_tf_ulm.RDS")
+
+brcaREG_tf <- decoupleR::run_ulm(brca_weightsREG_rna, 
+                              TFN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 5) 
+
+brcaREG_tf_df <- as.data.frame(dcast(as.data.table(brcaREG_tf[,2:4]), source ~ condition, value.var = "score"))
+rownames(brcaREG_tf_df) <- brcaREG_tf_df$source
+brcaREG_tf_df <- brcaREG_tf_df[,-1]
+
+saveRDS(brcaREG_tf, "kin_tf_prediction_results/brca_mofaREG_tf_ulm.RDS")
+
+#gbm
+gbm_tf <- decoupleR::run_ulm(gbm_weights_rna, 
+                              TFN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 5) 
+
+gbm_tf_df <- as.data.frame(dcast(as.data.table(gbm_tf[,2:4]), source ~ condition, value.var = "score"))
+rownames(gbm_tf_df) <- gbm_tf_df$source
+gbm_tf_df <- gbm_tf_df[,-1]
+
+saveRDS(gbm_tf, "kin_tf_prediction_results/gbm_mofa_tf_ulm.RDS")
+
+gbmREG_tf <- decoupleR::run_ulm(gbm_weightsREG_rna, 
+                              TFN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 5) 
+
+gbmREG_tf_df <- as.data.frame(dcast(as.data.table(gbmREG_tf[,2:4]), source ~ condition, value.var = "score"))
+rownames(gbmREG_tf_df) <- gbmREG_tf_df$source
+gbmREG_tf_df <- gbmREG_tf_df[,-1]
+
+saveRDS(gbmREG_tf, "kin_tf_prediction_results/gbm_mofaREG_tf_ulm.RDS")
+
+```
+
+
+##Kinase activity prediction on Phosphoproteomics layer of MOFA results with ulm
+```{r}
+#brca
+brca_kin <- decoupleR::run_ulm(brca_weights_phospho, 
+                              KSN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 3) 
+
+brca_kin_df <- as.data.frame(dcast(as.data.table(brca_kin[,2:4]), source ~ condition, value.var = "score"))
+rownames(brca_kin_df) <- brca_kin_df$source
+brca_kin_df <- brca_kin_df[,-1]
+
+saveRDS(brca_kin, "kin_tf_prediction_results/brca_mofa_kin_ulm.RDS")
+
+brcaREG_kin <- decoupleR::run_ulm(brca_weightsREG_phospho, 
+                              KSN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 3) 
+
+brcaREG_kin_df <- as.data.frame(dcast(as.data.table(brcaREG_kin[,2:4]), source ~ condition, value.var = "score"))
+rownames(brcaREG_kin_df) <- brcaREG_kin_df$source
+brcaREG_kin_df <- brcaREG_kin_df[,-1]
+
+saveRDS(brcaREG_kin, "kin_tf_prediction_results/brca_mofaREG_kin_ulm.RDS")
+
+#gbm
+gbm_kin <- decoupleR::run_ulm(gbm_weights_phospho, 
+                              KSN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 3) 
+
+gbm_kin_df <- as.data.frame(dcast(as.data.table(gbm_kin[,2:4]), source ~ condition, value.var = "score"))
+rownames(gbm_kin_df) <- gbm_kin_df$source
+gbm_kin_df <- gbm_kin_df[,-1]
+
+saveRDS(gbm_kin, "kin_tf_prediction_results/gbm_mofa_kin_ulm.RDS")
+
+gbmREG_kin <- decoupleR::run_ulm(gbm_weightsREG_phospho, 
+                              KSN, 
+                              .source='source', 
+                              .target='target', 
+                              minsize = 3) 
+
+gbmREG_kin_df <- as.data.frame(dcast(as.data.table(gbmREG_kin[,2:4]), source ~ condition, value.var = "score"))
+rownames(gbmREG_kin_df) <- gbmREG_kin_df$source
+gbmREG_kin_df <- gbmREG_kin_df[,-1]
+
+saveRDS(gbmREG_kin, "kin_tf_prediction_results/gbm_mofaREG_kin_ulm.RDS")
+```
+
+
+##Load all TF and Kinase activity prediction results
+```{r}
+brca_tf <- readRDS("kin_tf_prediction_results/brca_mofa_tf_ulm.RDS")
+brcaREG_tf <- readRDS("kin_tf_prediction_results/brca_mofaREG_tf_ulm.RDS")
+
+gbm_tf <- readRDS("kin_tf_prediction_results/gbm_mofa_tf_ulm.RDS")
+gbmREG_tf <- readRDS("kin_tf_prediction_results/gbm_mofaREG_tf_ulm.RDS")
+
+brca_kin <- readRDS("kin_tf_prediction_results/brca_mofa_kin_ulm.RDS")
+brcaREG_kin <- readRDS("kin_tf_prediction_results/brca_mofaREG_kin_ulm.RDS")
+
+gbm_kin <- readRDS("kin_tf_prediction_results/gbm_mofa_kin_ulm.RDS")
+gbmREG_kin <- readRDS("kin_tf_prediction_results/gbm_mofaREG_kin_ulm.RDS")
+```
+
+
+#Run MOON Kinase activty prediction based on TF activity prediction
+
+##Prep the Kinase-TF interactions network from omnipath
+```{r}
+#Pull base network from Omnipath
+full_pkn <- as.data.frame(import_omnipath_interactions())
+
+#Clean connections 
+full_pkn <- full_pkn[!is.na(full_pkn$references),]
+clean_PKN <- full_pkn[full_pkn$consensus_stimulation == 1 | full_pkn$consensus_inhibition == 1,]
+
+#Define sign 
+clean_PKN$sign <- clean_PKN$consensus_stimulation - clean_PKN$consensus_inhibition
+clean_PKN <- clean_PKN[,c(3,4,16)]
+
+#Repeat interactions with sign 0 to be in the list with both -1 and 1 sign
+clean_PKN_supp <- clean_PKN[clean_PKN$sign == 0,]
+clean_PKN_supp$sign <- -1
+clean_PKN[clean_PKN$sign == 0,"sign"] <- 1
+clean_PKN <- as.data.frame(rbind(clean_PKN, clean_PKN_supp))
+
+#Final format
+names(clean_PKN) <- c("source","target","interaction")
+clean_PKN <- clean_PKN[,c(1,3,2)]
+
+#Final clean
+meta_network_filtered <- meta_network_cleanup(clean_PKN)
+
+write_csv(x = clean_PKN, file = "network_ressources/clean_omnipath_PKN.csv")
+```
+
+##Filter & compress the network according to our input TFs
+```{r}
+#Choose Factor and data set and run the whole chunk
+#TF_data <- gbmREG_tf
+#RNA_data <- gbm_weightsREG_rna
+#kin_data <- gbmREG_kin
+#factor_n <- 6
+
+#TF_data <- brcaREG_tf
+#RNA_data <- brca_weightsREG_rna
+#kin_data <- brcaREG_kin
+#factor_n <- 4
+
+TF_data <- gbm_tf
+RNA_data <- gbm_weights_rna
+kin_data <- gbm_kin
+factor_n <- 5
+
+n_steps <- 6
+
+
+clean_PKN <- read_csv("network_ressources/clean_omnipath_PKN.csv")
+
+#RNA input for later filtering
+RNA_input <- RNA_data[,factor_n]
+names(RNA_input) <- rownames(RNA_data)
+
+#TF input from MOFA as downstream input
+TF_inputs_f <- TF_data[TF_data$condition == paste0("Factor", factor_n),]
+
+#TF results for one factor as named vector
+TF_inputs <- TF_inputs_f$score
+names(TF_inputs) <- TF_inputs_f$source
+downstream_inputs <- TF_inputs
+
+#filter TFs (downstream input) for TFs actually in the PKN
+downstream_inputs_filtered <- cosmosR:::filter_input_nodes_not_in_pkn(downstream_inputs, 
+                                                                      meta_network_filtered)
+
+#filter PKN for TFs that are downstream of our Kinases we have in the network 
+meta_network_filtered <- cosmosR:::keep_observable_neighbours(meta_network_filtered, 
+                                                              n_steps, 
+                                                              names(downstream_inputs_filtered))
+
+#compress PKN in a way that nodes with the same children are united
+meta_network_compressed_list <- compress_same_children(meta_network_filtered, 
+                                                       sig_input = c("wig"=""), #give it an empty name vector
+                                                       metab_input = downstream_inputs_filtered)
+meta_network_compressed <- meta_network_compressed_list$compressed_network
+
+#cleanup again to remove empty/ redunant connections
+meta_network_compressed <- meta_network_cleanup(meta_network_compressed)
+
+```
+
+##Run MOON in interation
+```{r}
+meta_network_rec_to_TFmetab <- meta_network_compressed
+
+before <- 1
+after <- 0
+i <- 1
+while (before != after & i < 10) {
+  before <- length(meta_network_rec_to_TFmetab[,1])
+  recursive_decoupleRnival_res <- cosmosR::moon( downstream_input = downstream_inputs_filtered, 
+                                                 meta_network = meta_network_rec_to_TFmetab, 
+                                                 n_layers = n_steps, 
+                                                 statistic = "ulm") 
+  
+  meta_network_rec_to_TFmetab <- filter_incohrent_TF_target(recursive_decoupleRnival_res, TFN, meta_network_rec_to_TFmetab, RNA_input)
+  after <- length(meta_network_rec_to_TFmetab[,1])
+  i <- i + 1
+}
+
+```
+
+#Compare and save results
+
+##Build comparason table
+```{r}
+kin_results <- kin_data 
+
+results_moon <- recursive_decoupleRnival_res
+all_results <- kin_results[kin_results$condition == paste0("Factor", factor_n), c(2,4)]
+
+all_results$moon_score <- results_moon$score[match(all_results$source, results_moon$source)]
+all_results$moon_level <- as.factor(results_moon$level[match(all_results$source, results_moon$source)])
+```
+
+##Visualization
+```{r}
+ggplot(all_results, aes(x=moon_score, y=score, color=moon_level)) +
+  geom_point()
+
+reg <- lm(score~moon_score, data = all_results[all_results$moon_level==1,])
+summary(reg)
+
+temp <- all_results[all_results$moon_level == 1,]
+
+ggplot(temp, aes(x=moon_score, y=score, color=moon_level)) +
+  geom_point()
+
+cor(temp$moon_score, temp$score, use = "pairwise.complete.obs", method = "spearman")
+
+```
+## Save all results
+```{r}
+
+#gbmf1_moon <- results_moon 
+#gbmf1_comparison <- all_results
+
+#gbmf2_moon <- results_moon 
+#gbmf2_comparison <- all_results
+
+
+#gbmf5_moon <- results_moon 
+#gbmf5_comparison <- all_results
+
+#gbmf1_REG_moon <- results_moon 
+#gbmf1_REG_comparison <- all_results
+
+#gbmf2_REG_moon <- results_moon 
+#gbmf2_REG_comparison <- all_results
+
+#This one has a very strong biological factor but unfortunately no good moon predictions 
+#gbmf6_REG_moon <- results_moon 
+#gbmf6_REG_comparison <- all_results
+```
+Best results are wth GBM_REG & GBM factor 1.
+
+
+```{r}
+
+#brcaf1_moon <- results_moon 
+#brcaf1_comparison <- all_results
+
+#brcaf1_REG_moon <- results_moon 
+#brcaf1_REG_comparison <- all_results
+
+#brcaf4_REG_moon <- results_moon 
+#brcaf4_REG_comparison <- all_results
+
+```
+BRCA overall looks worse then GBM...
+
+```{r}
+save(gbmf1_moon, gbmf1_comparison, 
+     gbmf2_moon, gbmf2_comparison, 
+     gbmf5_moon, gbmf5_comparison,
+     gbmf1_REG_moon, gbmf1_REG_comparison,
+     gbmf2_REG_moon, gbmf2_REG_comparison,
+     gbmf6_REG_moon, gbmf6_REG_comparison,
+     brcaf1_moon, brcaf1_comparison,
+     brcaf1_REG_moon, brcaf1_REG_comparison,
+     brcaf4_REG_moon, brcaf4_REG_comparison,
+     file = "cptac_moon_results.RData")
+```
+
+##Load all results
+```{r}
+load("cptac_moon_results.RData")
+
+results_moon <- gbmf1_REG_moon 
+all_results <- gbmf1_REG_comparison
+```
+
